@@ -194,7 +194,8 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     /**
      * The string manager for this package.
      */
-    protected static final StringManager sm = StringManager.getManager(WebappClassLoaderBase.class);
+    protected static final StringManager sm =
+        StringManager.getManager(Constants.Package);
 
 
     // ----------------------------------------------------------- Constructors
@@ -496,28 +497,27 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
             String protocol = url.getProtocol();
             if ("file".equalsIgnoreCase(protocol)) {
                 URI uri;
-                File f;
+                File file;
                 String path;
                 try {
                     uri = url.toURI();
-                    f = new File(uri);
-                    path = f.getCanonicalPath();
+                    file = new File(uri);
+                    path = file.getCanonicalPath();
                 } catch (IOException | URISyntaxException e) {
                     log.warn(sm.getString(
                             "webappClassLoader.addPermisionNoCanonicalFile",
                             url.toExternalForm()));
                     return;
                 }
-                if (f.isFile()) {
+                if (file.isFile()) {
                     // Allow the file to be read
                     addPermission(new FilePermission(path, "read"));
-                } else if (f.isDirectory()) {
+                } else if (file.isDirectory()) {
                     addPermission(new FilePermission(path, "read"));
                     addPermission(new FilePermission(
                             path + File.separator + "-", "read"));
-                } else {
-                    // File does not exist - ignore (shouldn't happen)
                 }
+
             } else {
                 // Unsupported URL protocol
                 log.warn(sm.getString(
@@ -777,7 +777,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
                     resources.getContext().getName()));
             return true;
         }
-
 
         // No classes have been modified
         return false;
@@ -1445,7 +1444,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
         ArrayList<URL> result = new ArrayList<>();
         result.addAll(localRepositories);
         result.addAll(Arrays.asList(super.getURLs()));
-        return result.toArray(new URL[0]);
+        return result.toArray(new URL[result.size()]);
     }
 
 
@@ -1712,7 +1711,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     @SuppressWarnings("deprecation") // thread.stop()
     private void clearReferencesThreads() {
         Thread[] threads = getThreads();
-        List<Thread> threadsToStop = new ArrayList<>();
+        List<Thread> executorThreadsToStop = new ArrayList<>();
 
         // Iterate over the set of threads
         for (Thread thread : threads) {
@@ -1808,52 +1807,58 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
                                 thread.getName(), getContextName()), e);
                     }
 
-                    // Stopping an executor automatically interrupts the
-                    // associated threads. For non-executor threads, interrupt
-                    // them here.
-                    if (!usingExecutor && !thread.isInterrupted()) {
-                        thread.interrupt();
+                    if (usingExecutor) {
+                        // Executor may take a short time to stop all the
+                        // threads. Make a note of threads that should be
+                        // stopped and check them at the end of the method.
+                        executorThreadsToStop.add(thread);
+                    } else {
+                        clearThread(thread, usingExecutor);
                     }
-
-                    // Threads are expected to take a short time to stop after
-                    // being interrupted. Make a note of all threads that are
-                    // expected to stop to enable them to be checked at the end
-                    // of this method.
-                    threadsToStop.add(thread);
                 }
             }
         }
 
-        // If thread stopping is enabled, threads should have been stopped above
-        // when the executor was shut down or the thread was interrupted but
-        // that depends on the thread correctly handling the interrupt. Check
-        // each thread and if any are still running give all threads up to a
-        // total of 2 seconds to shutdown.
+        // clear executor threads
+        for (Thread t : executorThreadsToStop) {
+            clearThread(t, true);
+        }
+    }
+
+    private void clearThread(Thread t, boolean usingExecutor) {
         int count = 0;
-        for (Thread t : threadsToStop) {
-            while (t.isAlive() && count < 100) {
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException e) {
-                    // Quit the while loop
-                    break;
-                }
-                count++;
+
+        // Step1: Interrupt all the threads
+        // executor is stopped thus executor threads are already interrupted
+        if (!usingExecutor && !t.isInterrupted()) {
+            t.interrupt();
+        }
+
+        // Step 2: Give threads up to 2 seconds to shutdown
+        while (t.isAlive() && count < 100) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                // Quit the while loop
+                break;
             }
-            if (t.isAlive()) {
-                // This method is deprecated and for good reason. This is
-                // very risky code but is the only option at this point.
-                // A *very* good reason for apps to do this clean-up
-                // themselves.
-                t.stop();
-            }
+            count++;
+        }
+
+        // Step 3: if thread is still alive, clear it using stop
+        if (t.isAlive()) {
+            // This method is deprecated and for good reason. This is
+            // very risky code but is the only option at this point.
+            // A *very* good reason for apps to do this clean-up
+            // themselves.
+            t.stop();
         }
     }
 
 
     /*
      * Look at a threads stack trace to see if it is a request thread or not. It
-     * isn't perfect, but it should be good-enough for most cases.
+git s     * isn't perfect, but it should be good-enough for most cases.
      */
     private boolean isRequestThread(Thread thread) {
 
@@ -1953,20 +1958,20 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
             Method expungeStaleEntriesMethod = tlmClass.getDeclaredMethod("expungeStaleEntries");
             expungeStaleEntriesMethod.setAccessible(true);
 
-            for (int i = 0; i < threads.length; i++) {
+            for (Thread thread : threads) {
                 Object threadLocalMap;
-                if (threads[i] != null) {
+                if (thread != null) {
 
                     // Clear the first map
-                    threadLocalMap = threadLocalsField.get(threads[i]);
-                    if (null != threadLocalMap){
+                    threadLocalMap = threadLocalsField.get(thread);
+                    if (null != threadLocalMap) {
                         expungeStaleEntriesMethod.invoke(threadLocalMap);
                         checkThreadLocalMapForLeaks(threadLocalMap, tableField);
                     }
 
                     // Clear the second map
-                    threadLocalMap =inheritableThreadLocalsField.get(threads[i]);
-                    if (null != threadLocalMap){
+                    threadLocalMap = inheritableThreadLocalsField.get(thread);
+                    if (null != threadLocalMap) {
                         expungeStaleEntriesMethod.invoke(threadLocalMap);
                         checkThreadLocalMapForLeaks(threadLocalMap, tableField);
                     }
@@ -1999,8 +2004,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
         if (map != null) {
             Object[] table = (Object[]) internalTableField.get(map);
             if (table != null) {
-                for (int j =0; j < table.length; j++) {
-                    Object obj = table[j];
+                for (Object obj : table) {
                     if (obj != null) {
                         boolean keyLoadedByWebapp = false;
                         boolean valueLoadedByWebapp = false;
@@ -2048,18 +2052,14 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
                                 log.error(sm.getString(
                                         "webappClassLoader.checkThreadLocalsForLeaks",
                                         args));
-                            } else if (value == null) {
-                                if (log.isDebugEnabled()) {
-                                    log.debug(sm.getString(
-                                            "webappClassLoader.checkThreadLocalsForLeaksNull",
-                                            args));
-                                }
-                            } else {
-                                if (log.isDebugEnabled()) {
-                                    log.debug(sm.getString(
-                                            "webappClassLoader.checkThreadLocalsForLeaksNone",
-                                            args));
-                                }
+                            } else if (value == null && log.isDebugEnabled()) {
+                                log.debug(sm.getString(
+                                        "webappClassLoader.checkThreadLocalsForLeaksNull",
+                                        args));
+                            } else if (log.isDebugEnabled()) {
+                                log.debug(sm.getString(
+                                        "webappClassLoader.checkThreadLocalsForLeaksNone",
+                                        args));
                             }
                         }
                     }
@@ -2078,8 +2078,8 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
 
     private String getStackTrace(Thread thread) {
         StringBuilder builder = new StringBuilder();
-        for (StackTraceElement ste : thread.getStackTrace()) {
-            builder.append("\n ").append(ste);
+        for (StackTraceElement stackTraceElement : thread.getStackTrace()) {
+            builder.append("\n ").append(stackTraceElement);
         }
         return builder.toString();
     }
@@ -2668,8 +2668,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     @Override
     public boolean hasLoggingConfig() {
         if (Globals.IS_SECURITY_ENABLED) {
-            Boolean result = AccessController.doPrivileged(new PrivilegedHasLoggingConfig());
-            return result.booleanValue();
+            return AccessController.doPrivileged(new PrivilegedHasLoggingConfig());
         } else {
             return findResource("logging.properties") != null;
         }
@@ -2680,7 +2679,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
 
         @Override
         public Boolean run() {
-            return Boolean.valueOf(findResource("logging.properties") != null);
+            return findResource("logging.properties") != null;
         }
     }
 
